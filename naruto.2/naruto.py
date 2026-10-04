@@ -5,8 +5,13 @@ import pickle
 import collections
 import numpy as np
 
+from sign_features import (hands_from_result, features, geometry, is_crossed,
+                           MAX_FINGER_GAP, MIN_CROSS_ANGLE, MIN_INDEX_EXT,
+                           MAX_OPEN_EXT)
+
 MODEL_PATH  = "hand_landmarker.task"
 SIGN_MODEL  = "sign_model.pkl"
+CONFIDENCE  = 0.6  # min model probability for a frame to count as the sign
 
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),
@@ -31,7 +36,11 @@ VisionRunningMode     = mp.tasks.vision.RunningMode
 options = HandLandmarkerOptions(
     base_options=BaseOptions(model_asset_path=MODEL_PATH),
     running_mode=VisionRunningMode.VIDEO,
-    num_hands=2
+    num_hands=2,
+    # crossed hands overlap; lower thresholds keep both hands tracked
+    min_hand_detection_confidence=0.3,
+    min_hand_presence_confidence=0.3,
+    min_tracking_confidence=0.3,
 )
 
 # ── Smoothing ──
@@ -55,21 +64,30 @@ def smooth_landmarks(result, hand_idx, w, h):
     return avg_points
 
 
-def extract_features(result):
-    """Extract same 84 features used during training."""
-    data  = []
-    hands = result.hand_landmarks if result.hand_landmarks else []
-    for hand_idx in range(2):
-        if hand_idx < len(hands):
-            for lm in hands[hand_idx]:
-                data += [round(lm.x, 4), round(lm.y, 4)]
-        else:
-            data += [0.0] * 42
-    return data
+def is_shadow_clone(result, aspect):
+    """Model must be confident AND the fingers must actually touch and cross.
+    Returns (ok, debug text explaining the decision)."""
+    h0, h1 = hands_from_result(result, aspect)[:2]
+    g = geometry(h0, h1)
+    proba = classifier.predict_proba([features(h0, h1)])[0]
+    p = proba[list(classifier.classes_).index("shadow_clone")]
+    checks = [
+        (f"gap {g['finger_gap']:.2f}",    g["finger_gap"] <= MAX_FINGER_GAP),
+        (f"angle {g['angle']:.0f}",       g["angle"] >= MIN_CROSS_ANGLE),
+        (f"index {g['min_index_ext']:.2f}", g["min_index_ext"] >= MIN_INDEX_EXT),
+        (f"curl {g['open_ext']:.2f}",     g["open_ext"] <= MAX_OPEN_EXT),
+        (f"cross {g['cross_0']:.2f}/{g['cross_1']:.2f}", is_crossed(g)),
+        (f"model {p:.2f}",                p >= CONFIDENCE),
+    ]
+    ok = all(passed for _, passed in checks)
+    return ok, checks
 
 
 # ── Prediction smoothing (avoid flickering) ──
+VOTES_NEEDED   = 4      # sign must be seen in 4 of the last 8 frames
 PRED_BUFFER    = collections.deque(maxlen=8)
+debug_checks   = []
+show_debug     = True   # press D to toggle the debug line
 flash_timer    = 0
 FLASH_DURATION = 2.0
 start_time     = time.time()
@@ -89,7 +107,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
         frame = cv2.flip(frame, 1)
         h, w  = frame.shape[:2]
 
-        small     = cv2.resize(frame, (320, 240))
+        small     = cv2.cvtColor(cv2.resize(frame, (320, 240)), cv2.COLOR_BGR2RGB)
         mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=small)
         timestamp = int((time.time() - start_time) * 1000)
         result    = landmarker.detect_for_video(mp_image, timestamp)
@@ -112,16 +130,17 @@ with HandLandmarker.create_from_options(options) as landmarker:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
         # ── Predict sign using trained model ──
+        # (a frame where one crossed hand is briefly lost counts as a miss
+        #  instead of wiping the whole vote)
         if result.hand_landmarks and len(result.hand_landmarks) == 2:
-            features = extract_features(result)
-            prediction = classifier.predict([features])[0]
-            PRED_BUFFER.append(prediction)
-
-            # Only trigger if last 6 out of 8 frames say shadow_clone
-            shadow_votes = list(PRED_BUFFER).count("shadow_clone")
-            if shadow_votes >= 6:
-                flash_timer = time.time()
+            ok, debug_checks = is_shadow_clone(result, w / h)
+            PRED_BUFFER.append("shadow_clone" if ok else "other")
         else:
+            PRED_BUFFER.append("other")
+            debug_checks = []
+
+        if list(PRED_BUFFER).count("shadow_clone") >= VOTES_NEEDED:
+            flash_timer = time.time()
             PRED_BUFFER.clear()
 
         # ── Show Shadow Clone Jutsu message ──
@@ -154,9 +173,21 @@ with HandLandmarker.create_from_options(options) as landmarker:
         cv2.putText(frame, f"Hands: {hand_count}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
+        # ── Debug: each check in green (pass) or red (fail) ──
+        if show_debug:
+            x = 10
+            for text, passed in debug_checks:
+                color = (0, 220, 0) if passed else (0, 0, 255)
+                cv2.putText(frame, text, (x, h - 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+                x += cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0][0] + 14
+
         cv2.imshow("Shadow Clone Jutsu Detector", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        if key == ord('d'):
+            show_debug = not show_debug
 
     cap.release()
     cv2.destroyAllWindows()

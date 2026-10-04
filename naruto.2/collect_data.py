@@ -101,7 +101,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
 
         frame     = cv2.flip(frame, 1)
         h, w      = frame.shape[:2]
-        small     = cv2.resize(frame, (320, 240))
+        small     = cv2.cvtColor(cv2.resize(frame, (320, 240)), cv2.COLOR_BGR2RGB)
         mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=small)
         timestamp = int((time.time() - start_time) * 1000)
         result    = landmarker.detect_for_video(mp_image, timestamp)
