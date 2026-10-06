@@ -29,7 +29,7 @@ MAX_OPEN_EXT = 1.25     # a hand with ring AND pinky this extended is an open ha
 # 0 = knuckles, 1 = fingertips. Fingertips merely touching the other hand's
 # fingers ("T" shape) lands at ~1.1+, a real cross lands inside both pairs.
 CROSS_MIN = -0.25
-CROSS_MAX = 0.95
+CROSS_MAX = 1.0
 
 
 def hands_from_raw(raw, aspect=ASPECT):
@@ -109,7 +109,10 @@ def is_crossed(g):
 
 
 def passes_geometry(h0, h1):
-    g = geometry(h0, h1)
+    return geometry_ok(geometry(h0, h1))
+
+
+def geometry_ok(g):
     return (g["finger_gap"] <= MAX_FINGER_GAP
             and g["angle"] >= MIN_CROSS_ANGLE
             and g["min_index_ext"] >= MIN_INDEX_EXT

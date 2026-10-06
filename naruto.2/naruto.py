@@ -3,9 +3,11 @@ import mediapipe as mp
 import time
 import pickle
 import collections
+import threading
 import numpy as np
 
-from sign_features import (hands_from_result, features, geometry, is_crossed,
+from clone_effect import CloneEffect
+from sign_features import (hands_from_result, features, geometry, geometry_ok, is_crossed,
                            MAX_FINGER_GAP, MIN_CROSS_ANGLE, MIN_INDEX_EXT,
                            MAX_OPEN_EXT)
 
@@ -25,6 +27,9 @@ HAND_CONNECTIONS = [
 # ── Load trained model ──
 with open(SIGN_MODEL, "rb") as f:
     classifier = pickle.load(f)
+# the first prediction starts the model's worker threads (~1.5 s) — do it now,
+# not the first time you make the sign
+classifier.predict_proba(np.zeros((1, classifier.n_features_in_)))
 print("Model loaded!")
 
 # ── MediaPipe setup ──
@@ -69,18 +74,54 @@ def is_shadow_clone(result, aspect):
     Returns (ok, debug text explaining the decision)."""
     h0, h1 = hands_from_result(result, aspect)[:2]
     g = geometry(h0, h1)
-    proba = classifier.predict_proba([features(h0, h1)])[0]
-    p = proba[list(classifier.classes_).index("shadow_clone")]
+    shape_ok = geometry_ok(g)
+    p = 0.0
+    if shape_ok:  # only pay for the model when the geometry already looks right
+        proba = classifier.predict_proba([features(h0, h1)])[0]
+        p = proba[list(classifier.classes_).index("shadow_clone")]
     checks = [
         (f"gap {g['finger_gap']:.2f}",    g["finger_gap"] <= MAX_FINGER_GAP),
         (f"angle {g['angle']:.0f}",       g["angle"] >= MIN_CROSS_ANGLE),
         (f"index {g['min_index_ext']:.2f}", g["min_index_ext"] >= MIN_INDEX_EXT),
         (f"curl {g['open_ext']:.2f}",     g["open_ext"] <= MAX_OPEN_EXT),
         (f"cross {g['cross_0']:.2f}/{g['cross_1']:.2f}", is_crossed(g)),
-        (f"model {p:.2f}",                p >= CONFIDENCE),
+        (f"model {p:.2f}" if shape_ok else "model -", p >= CONFIDENCE),
     ]
     ok = all(passed for _, passed in checks)
     return ok, checks
+
+
+class LatestFrame:
+    """Reads the camera on its own thread and keeps only the newest frame.
+    Without this, frames queue up whenever processing is slower than the
+    camera, and the video you see falls further and further behind."""
+
+    def __init__(self, cap):
+        self.cap     = cap
+        self.frame   = None
+        self.ok      = True
+        self.new     = threading.Event()
+        self.running = True
+        self.thread  = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+
+    def _reader(self):
+        while self.running:
+            self.ok, frame = self.cap.read()
+            if not self.ok:
+                self.new.set()
+                break
+            self.frame = frame
+            self.new.set()
+
+    def read(self):
+        self.new.wait()
+        self.new.clear()
+        return self.ok, self.frame
+
+    def stop(self):
+        self.running = False
+        self.thread.join(timeout=1)  # let it finish before the camera is released
 
 
 # ── Prediction smoothing (avoid flickering) ──
@@ -91,6 +132,7 @@ show_debug     = True   # press D to toggle the debug line
 flash_timer    = 0
 FLASH_DURATION = 2.0
 start_time     = time.time()
+clones         = CloneEffect()  # press C to make the clones vanish early
 
 with HandLandmarker.create_from_options(options) as landmarker:
     cap = cv2.VideoCapture(0)
@@ -98,11 +140,17 @@ with HandLandmarker.create_from_options(options) as landmarker:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     cap.set(cv2.CAP_PROP_FPS, 30)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    camera   = LatestFrame(cap)
+    fps      = 0.0
+    last_t   = time.time()
 
     while cap.isOpened():
-        success, frame = cap.read()
+        success, frame = camera.read()
         if not success:
             break
+        now    = time.time()
+        fps    = 0.9 * fps + 0.1 / max(now - last_t, 1e-6)  # smoothed
+        last_t = now
 
         frame = cv2.flip(frame, 1)
         h, w  = frame.shape[:2]
@@ -112,8 +160,26 @@ with HandLandmarker.create_from_options(options) as landmarker:
         timestamp = int((time.time() - start_time) * 1000)
         result    = landmarker.detect_for_video(mp_image, timestamp)
 
+        # ── Predict sign using trained model ──
+        # (a frame where one crossed hand is briefly lost counts as a miss
+        #  instead of wiping the whole vote)
+        if result.hand_landmarks and len(result.hand_landmarks) == 2:
+            ok, debug_checks = is_shadow_clone(result, w / h)
+            PRED_BUFFER.append("shadow_clone" if ok else "other")
+        else:
+            PRED_BUFFER.append("other")
+            debug_checks = []
+
+        if list(PRED_BUFFER).count("shadow_clone") >= VOTES_NEEDED:
+            flash_timer = time.time()
+            clones.trigger()
+            PRED_BUFFER.clear()
+
+        # ── Clones (uses the same RGB frame the hand tracker saw) ──
+        frame = clones.apply(frame, small)
+
         # ── Draw smoothed landmarks ──
-        if result.hand_landmarks:
+        if result.hand_landmarks and not clones.active:
             for i in range(len(result.hand_landmarks)):
                 points = smooth_landmarks(result, i, w, h)
                 if points is None:
@@ -129,33 +195,15 @@ with HandLandmarker.create_from_options(options) as landmarker:
                                 (points[0][0] - 30, points[0][1] - 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
 
-        # ── Predict sign using trained model ──
-        # (a frame where one crossed hand is briefly lost counts as a miss
-        #  instead of wiping the whole vote)
-        if result.hand_landmarks and len(result.hand_landmarks) == 2:
-            ok, debug_checks = is_shadow_clone(result, w / h)
-            PRED_BUFFER.append("shadow_clone" if ok else "other")
-        else:
-            PRED_BUFFER.append("other")
-            debug_checks = []
-
-        if list(PRED_BUFFER).count("shadow_clone") >= VOTES_NEEDED:
-            flash_timer = time.time()
-            PRED_BUFFER.clear()
-
         # ── Show Shadow Clone Jutsu message ──
         if time.time() - flash_timer < FLASH_DURATION:
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.2, frame, 0.6, 0, frame)
-
             text       = "SHADOW CLONE JUTSU!"
             font       = cv2.FONT_HERSHEY_DUPLEX
             font_scale = 1.2
             thickness  = 3
             text_size  = cv2.getTextSize(text, font, font_scale, thickness)[0]
             text_x     = (w - text_size[0]) // 2
-            text_y     = h // 2
+            text_y     = 85  # top of the screen, so it doesn't cover the clones
 
             cv2.putText(frame, text, (text_x + 3, text_y + 3),
                         font, font_scale, (0, 0, 0), thickness + 2)
@@ -172,6 +220,8 @@ with HandLandmarker.create_from_options(options) as landmarker:
         hand_count = len(result.hand_landmarks) if result.hand_landmarks else 0
         cv2.putText(frame, f"Hands: {hand_count}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(frame, f"FPS: {fps:.0f}", (w - 100, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         # ── Debug: each check in green (pass) or red (fail) ──
         if show_debug:
@@ -188,6 +238,10 @@ with HandLandmarker.create_from_options(options) as landmarker:
             break
         if key == ord('d'):
             show_debug = not show_debug
+        if key == ord('c'):
+            clones.dismiss()
 
+    camera.stop()
     cap.release()
     cv2.destroyAllWindows()
+    clones.close()

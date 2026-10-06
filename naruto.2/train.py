@@ -1,7 +1,7 @@
 """
 train.py — Train Shadow Clone Sign Classifier
 =============================================
-Reads sign_data.csv and trains a Random Forest on hand-shape features
+Reads sign_data.csv and trains a gradient boosting model on hand-shape features
 (see sign_features.py). Saves the model as sign_model.pkl
 
 The recorded "other" data has very few two-hand wrong signs, so the model used
@@ -19,7 +19,7 @@ and augment everything (rotation, scale, mirror, jitter).
 import csv
 import pickle
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import classification_report
 
 from sign_features import (hands_from_raw, features, geometry, passes_geometry,
@@ -214,8 +214,9 @@ def split(items, frac=0.2):
 
 
 def make_model():
-    return RandomForestClassifier(n_estimators=150, min_samples_leaf=2,
-                                  class_weight="balanced", random_state=42, n_jobs=-1)
+    # predicts one frame in ~5 ms (a 150-tree random forest took ~20 ms)
+    return HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1,
+                                          class_weight="balanced", random_state=42)
 
 
 pool_all = [p for p in single + [h for pair in neg2 for h in pair] if not_sign_hand(p)]
@@ -249,7 +250,6 @@ X, y, _, _ = build(pos, neg2, pool_all)
 print(f"\nTraining final model on all {len(y)} samples...")
 model = make_model()
 model.fit(X, y)
-model.set_params(n_jobs=1)  # predicting one frame at a time: threads only add lag
 
 with open(MODEL_FILE, "wb") as f:
     pickle.dump(model, f)
